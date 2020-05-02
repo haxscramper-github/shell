@@ -9,6 +9,7 @@ license       = "MIT"
 # Dependencies
 
 requires "nim >= 0.19.0"
+requires "libssh >= 0.1.4"
 
 task test, "executes the tests":
   exec "nim c -d:debugShell -r tests/tShell.nim"

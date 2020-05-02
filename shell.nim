@@ -4,6 +4,8 @@ when not defined(NimScript):
 import strutils, strformat
 export strformat
 
+import ssh_exec
+
 type
   InfixKind = enum
     ifSlash = "/"
@@ -15,10 +17,10 @@ type
     ifAnd = "&&"
 
   DebugOutputKind* = enum
-    dokCommand
-    dokError
-    dokOutput
-    dokRuntime
+    dokCommand ## Do not print command
+    dokError ## Do not echo stderr
+    dokOutput ## Do not echo stdout
+    dokRuntime ## Dot not print error on command failure
 
 
 type
@@ -52,6 +54,35 @@ const defaultDebugConfig: set[DebugOutputKind] =
 
 
     config
+
+
+type
+  ShellRunConfig* = object
+    outputConfig*: set[DebugOutputKind]
+    workDir*: string
+    case procKind*: ShellProcKind
+    of spkRemote:
+      case newConn*: bool
+      of true:
+        username*: string
+        password*: string
+        hostname*: string
+        pubkeyFile*: string
+        privkeyFile*: string
+      of false:
+        session*: SSHConnection
+    of spkLocal:
+      nil
+
+
+let defaultShellRunConf =
+  ShellRunConfig(
+    procKind: spkLocal,
+    outputConfig: defaultDebugConfig
+  )
+
+proc contains(conf: ShellRunConfig, c: DebugOutputKind): bool =
+  c in conf.outputConfig
 
 proc stringify(cmd: NimNode): string
 proc iterateTree(cmds: NimNode): string
@@ -239,12 +270,40 @@ proc concatCmds(cmds: seq[string], sep = " && "): string =
 
 proc asgnShell*(
   cmd: string,
-  debugConfig: set[DebugOutputKind] = defaultDebugConfig
+  config: ShellRunConfig = defaultShellRunConf
               ): tuple[output, error: string, exitCode: int] =
   ## wrapper around `execCmdEx`, which returns the output of the shell call
   ## as a string (stripped of `\n`)
   when not defined(NimScript):
-    let pid = startProcess(cmd, options = {poEvalCommand})
+    let pid =
+      case config.procKind:
+        of spkLocal:
+          startProcess(ShellCommand(
+            cmdString: cmd,
+            workDir: config.workDir
+          ))
+        of spkRemote:
+          assert config.workDir.len > 0, "Cannot execute remote command without working directory"
+          assert config.hostname.len > 0, "Cannot execute remote command with empty hostname"
+
+          var session =
+            if config.newConn:
+              openSSHConnection(
+                username = config.username,
+                hostname = config.hostname,
+                password = config.password,
+                pubkeyFile = config.pubkeyFile,
+                privkeyFile = config.privkeyFile
+              )
+            else:
+              config.session
+
+          session.startProcess(
+            ShellCommand(
+              cmdString: cmd,
+              workdir: config.workDir
+            ))
+
     let outStream = pid.outputStream
     var line = ""
     var res = ""
@@ -252,7 +311,7 @@ proc asgnShell*(
       try:
         let streamRes = outStream.readLine(line)
         if streamRes:
-          if dokOutput in debugConfig:
+          if dokOutput in config:
             echo "shell> ", line
           res = res & "\n" & line
         else:
@@ -266,7 +325,7 @@ proc asgnShell*(
         break
 
     if not outStream.atEnd():
-      if dokOutput in debugConfig:
+      if dokOutput in config:
         let rem = outStream.readAll()
         res &= rem
         for line in rem.split("\n"):
@@ -284,10 +343,10 @@ proc asgnShell*(
     err.close()
 
     if exitCode != 0:
-      if dokRuntime in debugConfig:
+      if dokRuntime in config:
         echo "Error when executing: ", cmd
 
-      if dokError in debugConfig:
+      if dokError in config:
         for line in errorText.split("\n"):
           echo "err> ", line
 
@@ -304,7 +363,7 @@ proc asgnShell*(
 
 proc execShell*(
   cmd: string,
-  debugConfig: set[DebugOutputKind] = defaultDebugConfig
+  debugConfig: ShellRunConfig = defaultShellRunConf
               ): tuple[output, error: string, exitCode: int] =
   ## wrapper around `asgnShell`, which calls the commands and handles
   ## return values.
@@ -385,7 +444,7 @@ proc nilOrQuote(cmd: string): NimNode =
   else:
     result = newLit(cmd)
 
-macro shellVerboseImpl*(debugConfig, cmds: untyped): untyped =
+macro shellVerboseImpl*(config, cmds: untyped): untyped =
   ## a mini DSL to write shell commands in Nim. Some constructs are not
   ## implemented. If in doubt, put (parts of) the command into " "
   ## The command is echoed before it is run. It is prefixed by `shellCmd:`.
@@ -403,6 +462,7 @@ macro shellVerboseImpl*(debugConfig, cmds: untyped): untyped =
   result = newStmtList()
   let shCmds = genShellCmds(cmds)
 
+
   # we use two temporary variables. One to store total output of all commands
   # and the other to store the last exitCode.
   let exCodeSym = genSym(nskVar, "exitCode")
@@ -417,13 +477,27 @@ macro shellVerboseImpl*(debugConfig, cmds: untyped): untyped =
     let qCmd = nilOrQuote(cmd)
     result.add quote do:
       # use the exit code to determine if next command should be run
+      let debugConfig =
+        when `config` is set[DebugOutputKind]:
+          ShellRunConfig(
+            procKind: spkLocal,
+            outputConfig: `config`
+          )
+        else:
+          static:
+            assert `config` is ShellRunConfig,
+              "Expected either `ShellRunConfig` or `set[DebugOutputKind]`, " &
+              "but conifg is of type " & $typeof(`config`)
+
+          `config`
+
       if `exCodeSym` == 0:
-        let tmp = execShell(`qCmd`, `debugConfig`)
+        let tmp = execShell(`qCmd`, debugConfig)
         `outputSym` = `outputSym` & tmp[0]
         `outerrSym` = tmp[1]
         `exCodeSym` = tmp[2]
       else:
-        if dokRuntime in `debugConfig`:
+        if dokRuntime in debugConfig:
           echo "Skipped command `" &
             `qCmd` &
             "` due to failure in previous command!"
@@ -538,3 +612,17 @@ macro shellAssign*(cmd: untyped): untyped =
 
   when defined(debugShell):
     echo result.repr
+
+when isMainModule:
+  let conf = ShellRunConfig(
+    newConn: true,
+    procKind: spkRemote,
+    username: "ssh-test-user",
+    password: "ssh-password",
+    hostname: "localhost",
+    workdir: "/tmp"
+  )
+
+  discard shellVerboseErr(conf):
+    cd /tmp
+    ls
