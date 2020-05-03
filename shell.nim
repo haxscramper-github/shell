@@ -1,10 +1,12 @@
 import macros
 when not defined(NimScript):
-  import osproc, streams, os
+  import streams, os
 import strutils, strformat
 export strformat
 
 import ssh_exec
+
+const compiled = not defined(NimScript)
 
 type
   InfixKind = enum
@@ -21,6 +23,7 @@ type
     dokError ## Do not echo stderr
     dokOutput ## Do not echo stdout
     dokRuntime ## Dot not print error on command failure
+    dokSSHRemote ## Log ssh events (connection close/open)
 
 
 type
@@ -34,7 +37,7 @@ type
 const defaultDebugConfig: set[DebugOutputKind] =
   block:
     var config: set[DebugOutputKind] = {
-      dokOutput, dokError, dokCommand, dokRuntime
+      dokOutput, dokError, dokCommand, dokRuntime, dokSSHRemote
     }
 
     when defined shellNoDebugOutput:
@@ -49,9 +52,11 @@ const defaultDebugConfig: set[DebugOutputKind] =
     when defined shellNoDebugRuntime:
       config = config - {dokRuntime}
 
+    when defined shellNoSSHRemote:
+      config = config - {dokSSHRemote}
+
     when defined shellThrowException:
       config = {}
-
 
     config
 
@@ -81,7 +86,7 @@ let defaultShellRunConf =
     outputConfig: defaultDebugConfig
   )
 
-proc contains(conf: ShellRunConfig, c: DebugOutputKind): bool =
+proc contains*(conf: ShellRunConfig, c: DebugOutputKind): bool =
   c in conf.outputConfig
 
 proc stringify(cmd: NimNode): string
@@ -275,7 +280,7 @@ proc asgnShell*(
   ## wrapper around `execCmdEx`, which returns the output of the shell call
   ## as a string (stripped of `\n`)
   when not defined(NimScript):
-    let pid =
+    var pid =
       case config.procKind:
         of spkLocal:
           startProcess(ShellCommand(
@@ -288,6 +293,9 @@ proc asgnShell*(
 
           var session =
             if config.newConn:
+              if dokRuntime in config:
+                echo "ssh> opening new connection"
+
               openSSHConnection(
                 username = config.username,
                 hostname = config.hostname,
@@ -307,7 +315,7 @@ proc asgnShell*(
     let outStream = pid.outputStream
     var line = ""
     var res = ""
-    while pid.running:
+    while pid.canReadStdout():
       try:
         let streamRes = outStream.readLine(line)
         if streamRes:
@@ -350,7 +358,15 @@ proc asgnShell*(
         for line in errorText.split("\n"):
           echo "err> ", line
 
-    pid.close()
+    pid.close(connectionClose = (
+      block:
+        if config.procKind == spkRemote and config.newConn:
+          if dokSSHRemote in config:
+            echo "ssh> closing connection"
+          true
+        else:
+          false
+    ))
     result = (output: res, error: errorText, exitCode: exitCode)
   else:
     # prepend the NimScript called command by current directory
@@ -617,12 +633,13 @@ when isMainModule:
   let conf = ShellRunConfig(
     newConn: true,
     procKind: spkRemote,
+    outputConfig: defaultDebugConfig,
     username: "ssh-test-user",
     password: "ssh-password",
     hostname: "localhost",
-    workdir: "/tmp"
+    workdir: "/tmp",
   )
 
-  discard shellVerboseErr(conf):
-    cd /tmp
-    ls
+  let (res, err, code) = shellVerboseErr(conf):
+    whoami
+    ls "/"
