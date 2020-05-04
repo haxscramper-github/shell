@@ -1,4 +1,8 @@
 import strutils
+import sequtils
+import os
+import bitops
+import strformat
 import net
 import posix
 import streams
@@ -6,6 +10,8 @@ import osproc
 import strtabs
 
 import libssh2
+
+const defBufSize = 1024
 
 type
   SSHError* = ref object of CatchableError
@@ -77,17 +83,18 @@ proc close*(c: SSHConnection) =
   discard c.session.sessionFree()
   c.socket.close()
 
-# proc `=destroy`*(c: var SSHConnection) =
-#   c.shutdown()
-
-proc sshInit(hostname: string, port: int = 22): SSHConnection =
+proc sshInit*(hostname: string, port: int = 22): SSHConnection =
   ## Init ssh library, create new socket, init new ssh session
-  var rc = init(0)
-  if rc != 0:
-    raise SSHError(
-      msg: "libssh2 initialization failed",
-      rc: rc
-    )
+  var initDone {.global.} = false
+  if not initDone:
+    var rc = init(0)
+    if rc != 0:
+      raise SSHError(
+        msg: "libssh2 initialization failed",
+        rc: rc
+      )
+
+    initDone = true
 
   result = SSHConnection(
     socket: newSocket(),
@@ -98,7 +105,7 @@ proc sshInit(hostname: string, port: int = 22): SSHConnection =
   result.session.sessionSetBlocking(0)
 
 
-proc sshHandshake(c: var SSHConnection): void =
+proc sshHandshake*(c: var SSHConnection): void =
   var rc = 0
   while true:
     rc = c.session.sessionHandshake(c.socket.getFd())
@@ -111,7 +118,7 @@ proc sshHandshake(c: var SSHConnection): void =
       rc: rc
     )
 
-proc sshKnownHosts(ssc: var SSHConnection, hostname: string): void =
+proc sshKnownHosts*(ssc: var SSHConnection, hostname: string): void =
   var knownHosts = ssc.session.knownHostInit()
   if knownHosts.isNil:
     ssc.close()
@@ -168,7 +175,7 @@ proc sshKnownHosts(ssc: var SSHConnection, hostname: string): void =
 
 # TODO separate into two functions: public key OR password. Do not
 # implicitly mix two different authentification methods.
-proc sshAuth(
+proc sshAuth*(
   ssc: var SSHConnection,
   password: string = "",
   username: string,
@@ -490,3 +497,176 @@ proc main() =
     echo "-> ", rproc.outputStream().readLine()
 
 # main()
+
+proc getSessionError(s: Session): tuple[rc: cint, msg: string] =
+  var errbuf = allocCStringArray([""])
+  var errlen: cint = 0
+  let err = s.sessionLastError(addr errbuf[0], addr errlen, 0)
+  let msg = $errbuf[0]
+  deallocCStringArray(errbuf)
+
+  return (rc: err, msg: msg)
+
+
+type
+  SFTPFStream = ref object of Stream
+    mode: FileMode
+    channel: Channel ## SSH Channel for remote file
+    handle: SftpHandle
+    session: Sftp
+    buffer: string
+
+proc bitand[T: SomeInteger](ints: openarray[T]): T =
+  toSeq(ints).foldl(bitand(a, b))
+
+proc sftpOpen(
+  s: Session,
+  remotepath: string,
+  mode: FileMode = fmWrite,
+  permissions: int = 0777
+     ): SFTPFStream =
+  new(result)
+
+  result.closeImpl =
+    proc(s: Stream): void =
+      var sftp = cast[SFTPFStream](s)
+      discard sftp.handle.sftpClose()
+      discard sftp.session.sftpShutdown()
+
+  result.readDataImpl =
+    proc(s: Stream, buffer: pointer, buflen: int): int =
+      var sftp = SFTPFStream(s)
+      # NOTE cannot raise in streams implementation
+      # assert sftp.mode in {fmRead, fmReadWriteExisting, fmReadWrite},
+      #   &"Cannot read from SFTP file stream confgured as {sftp.mode}"
+
+      let copylen = min(buflen, sftp.buffer.len)
+
+      if copylen > 0: # has data in buffer, reading it first
+        copymem(buffer, sftp.buffer.cstring, copylen)
+        sftp.buffer = sftp.buffer[buflen .. ^1]
+      else: # No data in buffer, need to read from remote first
+
+        # Read data into buffer
+        sftp.buffer = newStringOfCap(defBufSize)
+        discard sftp.handle.sftpRead(sftp.buffer.cstring, defBufSize)
+
+        # Cann proc again - this is not realy a recurisve call since
+        # only one level should be ever active.
+        return s.readDataImpl(s, buffer, buflen)
+
+  result.mode = mode
+  result.session = sftp_init(s)
+
+  if result.session == nil:
+    raise SSHError(
+      msg: "Failed to init SFTP session"
+    )
+
+  let flags =
+    case mode:
+      of fmWrite: bitand [
+        LIBSSH2_FXF_WRITE,
+        LIBSSH2_FXF_CREAT,
+        LIBSSH2_FXF_TRUNC
+      ]
+
+      of fmRead: bitand [
+        LIBSSH2_FXF_READ
+      ]
+
+      of fmReadWrite: bitand [
+        LIBSSH2_FXF_WRITE,
+        LIBSSH2_FXF_READ,
+        LIBSSH2_FXF_CREAT,
+        LIBSSH2_FXF_TRUNC
+      ]
+
+      of fmReadWriteExisting: bitand [
+        LIBSSH2_FXF_WRITE,
+        LIBSSH2_FXF_READ,
+        LIBSSH2_FXF_TRUNC
+      ]
+
+      of fmAppend: bitand [
+        LIBSSH2_FXF_WRITE,
+        LIBSSH2_FXF_CREAT,
+        LIBSSH2_FXF_APPEND
+      ]
+
+  result.handle = result.session.sftpOpen(
+    filename = remotepath.cstring,
+    flags = cast[int32](flags),
+    mode = cast[int32](bitand(permissions, 0777))
+  )
+
+
+
+proc scpSendFile*(
+  ssc: var SSHConnection,
+  localPath, remotePath: string,
+  permissions: int = 0777): void =
+
+  let fileStat =
+    block:
+      var res: Stat
+      let rc = stat(localPath.cstring, res)
+      # IMPLEMENT check error code
+      res
+
+  assert localPath.fileExists()
+
+  var channel: Channel
+  while channel == nil: # REFACTOR into separate function
+    channel = ssc.session.scpSend(
+      path = remotePath,
+      mode = bitand(
+        cast[int](fileStat.stMode),
+        permissions),
+      size = fileStat.stSize
+    )
+
+    if channel == nil:
+      let (err, msg) = ssc.session.getSessionError()
+      if err != LIBSSH2_ERROR_EAGAIN:
+        raise SSHError(
+          msg: &"Unable to open session. {msg} rc: {err}",
+          rc: err
+        )
+
+  echo "\t created channel"
+  var file = localPath.open()
+
+  var buf: array[1024, char]
+  while true:
+    var nread = file.readBuffer(addr buf, 1024)
+    var bufpos = 0
+
+    if nread == 0:
+        break
+
+    echo &"\tread {nread} from file"
+
+    while bufpos < nread: # Until we send buffer
+      let rc = channel.channelWrite(addr buf, nread)
+
+      if rc < 0 and rc != LIBSSH2_ERROR_EAGAIN:
+        let (err, msg) = ssc.session.getSessionError()
+        raise SSHError(
+          msg: msg,
+          rc: err
+        )
+
+      elif rc == LIBSSH2_ERROR_EAGAIN:
+        discard
+
+      else:
+        bufpos += rc
+        echo &"\tsent {rc} bytes"
+
+  file.close()
+  discard channel.channelSendEOF()
+  discard channel.channelWaitEOF()
+  discard channel.channelWaitClosed()
+  discard channel.channelFree()
+  channel = nil

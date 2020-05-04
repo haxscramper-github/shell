@@ -630,16 +630,31 @@ macro shellAssign*(cmd: untyped): untyped =
     echo result.repr
 
 when isMainModule:
-  let conf = ShellRunConfig(
-    newConn: true,
-    procKind: spkRemote,
-    outputConfig: defaultDebugConfig,
-    username: "ssh-test-user",
-    password: "ssh-password",
-    hostname: "localhost",
-    workdir: "/tmp",
-  )
+  if true:
+    block:
+      var conn = sshInit("localhost", 22)
+      conn.sshHandshake()
+      conn.sshKnownHosts("localhost")
+      conn.sshAuth(
+        username = "ssh-test-user",
+        password = "ssh-password"
+      )
 
-  let (res, err, code) = shellVerboseErr(conf):
-    whoami
-    ls "/"
+      "/tmp/test.txt".writeFile("hello world!".repeat(256))
+      conn.scpSendFile("/tmp/test.txt", "/tmp/remote.txt")
+
+
+  if false:
+    let conf = ShellRunConfig(
+      newConn: true,
+      procKind: spkRemote,
+      outputConfig: defaultDebugConfig,
+      username: "ssh-test-user",
+      password: "ssh-password",
+      hostname: "localhost",
+      workdir: "/tmp",
+    )
+
+    let (res, err, code) = shellVerboseErr(conf):
+      whoami
+      ls "/"
