@@ -1,4 +1,5 @@
 import strutils
+import ssh_errors
 import sequtils
 import os
 import bitops
@@ -416,6 +417,22 @@ proc peekExitCode*(sproc: ShellProcess): int =
     of spkRemote:
       sproc.rproc.connection.sshCommandGetExit().code
 
+template bufferedReadLine(atEnd, buffer, lineResult: typed): untyped =
+  ## Read single line into variable `lineResult` from buffer `buffer`
+  ## using `atEnd` to check for input end. It is assumed that `atEnd`
+  ## performs test reading into buffer and thus `while not atEnd` will
+  ## run until there is no more data. When line is read `return true`
+  ## is executed.
+  while not atEnd:
+    let eol = buffer.find({'\0', '\L', '\c', '\n'})
+    if eol != -1:
+      lineResult = buffer[0 ..< eol]
+      buffer = buffer[eol + 1 .. ^1]
+      return true
+
+  lineResult = buffer
+  buffer = ""
+
 proc processOutput(rproc: var RemoteProcess, isErr: static[bool] = false): RemoteStream =
   new(result)
   result.conn = rproc.connection
@@ -450,17 +467,22 @@ proc processOutput(rproc: var RemoteProcess, isErr: static[bool] = false): Remot
         discard
 
       else:
-        while not conn.noMoreData():
-          let eol = conn.outbuf.find({'\0', '\L', '\c', '\n'})
-          # echo conn.outbuf.mapIt(it)
-          # echo "eol is: ", eol
-          if eol != -1:
-            line = conn.outbuf[0 ..< eol]
-            conn.outbuf = conn.outbuf[eol + 1 .. ^1]
-            return true
+        bufferedReadLine(
+          atEnd = conn.noMoredata(),
+          buffer = conn.outbuf,
+          lineResult = line
+        )
+        # while not conn.noMoreData():
+        #   let eol = conn.outbuf.find({'\0', '\L', '\c', '\n'})
+        #   # echo conn.outbuf.mapIt(it)
+        #   # echo "eol is: ", eol
+        #   if eol != -1:
+        #     line = conn.outbuf[0 ..< eol]
+        #     conn.outbuf = conn.outbuf[eol + 1 .. ^1]
+        #     return true
 
-        line = conn.outbuf
-        conn.outbuf = ""
+        # line = conn.outbuf
+        # conn.outbuf = ""
 
 
 proc outputStream*(rproc: var RemoteProcess): Stream =
@@ -498,7 +520,7 @@ proc main() =
 
 # main()
 
-proc getSessionError(s: Session): tuple[rc: cint, msg: string] =
+proc getSessionError*(s: Session): tuple[rc: cint, msg: string] =
   var errbuf = allocCStringArray([""])
   var errlen: cint = 0
   let err = s.sessionLastError(addr errbuf[0], addr errlen, 0)
@@ -519,81 +541,161 @@ type
 proc bitand[T: SomeInteger](ints: openarray[T]): T =
   toSeq(ints).foldl(bitand(a, b))
 
-proc sftpOpen(
-  s: Session,
-  remotepath: string,
-  mode: FileMode = fmWrite,
-  permissions: int = 0777
-     ): SFTPFStream =
-  new(result)
+func fileModeToLibSSH(mode: FileMode): int =
+  case mode:
+    of fmWrite: bitand [
+      LIBSSH2_FXF_WRITE,
+      LIBSSH2_FXF_CREAT,
+      LIBSSH2_FXF_TRUNC
+    ]
 
-  result.closeImpl =
+    of fmRead: bitand [
+      LIBSSH2_FXF_READ
+    ]
+
+    of fmReadWrite: bitand [
+      LIBSSH2_FXF_WRITE,
+      LIBSSH2_FXF_READ,
+      LIBSSH2_FXF_CREAT,
+      LIBSSH2_FXF_TRUNC
+    ]
+
+    of fmReadWriteExisting: bitand [
+      LIBSSH2_FXF_WRITE,
+      LIBSSH2_FXF_READ,
+      LIBSSH2_FXF_TRUNC
+    ]
+
+    of fmAppend: bitand [
+      LIBSSH2_FXF_WRITE,
+      LIBSSH2_FXF_CREAT,
+      LIBSSH2_FXF_APPEND
+    ]
+
+
+proc noMoreData(sftp: SFTPFStream): bool =
+  ## Return `true` if no more data can be read from remote file. If
+  ## `sftp` buffer is empty test read is done to check for data
+  ## availability: stream buffer is updated (result of the test read
+  ## is appended to the buffer).
+
+  if sftp.buffer.len > 0:
+    return false
+
+  while true:
+    var buf: array[1024, char]
+    let rc = sftp.handle.sftpRead(addr buf, sizeof buf)
+
+    echo "\tread ", rc, " bytes from handle"
+
+    if rc == 0:
+      return true
+    elif rc == LIBSSH2_ERROR_EAGAIN:
+      echo "\ttrying to read again"
+      discard
+    elif rc < 0:
+      echo "\tno more data"
+      return true
+      # raise SSHError(
+      #   msg: "Failed to read from remote",
+      #   rc: rc
+      # )
+
+    else:
+      sftp.buffer &= buf[0 .. rc].join()
+      return false
+
+
+proc initSFTPStream(s: var SFTPFStream): void =
+  s.closeImpl =
     proc(s: Stream): void =
       var sftp = cast[SFTPFStream](s)
       discard sftp.handle.sftpClose()
       discard sftp.session.sftpShutdown()
 
-  result.readDataImpl =
+  s.atEndImpl =
+    proc(s: Stream): bool =
+      var sftp = cast[SFTPFStream](s)
+      return sftp.noMoreData()
+
+  s.readDataImpl =
     proc(s: Stream, buffer: pointer, buflen: int): int =
       var sftp = SFTPFStream(s)
       # NOTE cannot raise in streams implementation
       # assert sftp.mode in {fmRead, fmReadWriteExisting, fmReadWrite},
       #   &"Cannot read from SFTP file stream confgured as {sftp.mode}"
 
-      let copylen = min(buflen, sftp.buffer.len)
+      var readCount = 0
+      while readCount < buflen:
+        echo "\treading more data from buffer"
+        if sftp.noMoreData():
+          echo "\tin total read ", readCount, " from remote file"
+          return readCount
+        else:
+          let tocopy = min(sftp.buffer.len , buflen - readCount)
 
-      if copylen > 0: # has data in buffer, reading it first
-        copymem(buffer, sftp.buffer.cstring, copylen)
-        sftp.buffer = sftp.buffer[buflen .. ^1]
-      else: # No data in buffer, need to read from remote first
+          copymem(buffer, sftp.buffer.cstring, tocopy)
+          sftp.buffer = sftp.buffer[tocopy .. ^1]
 
-        # Read data into buffer
-        sftp.buffer = newStringOfCap(defBufSize)
-        discard sftp.handle.sftpRead(sftp.buffer.cstring, defBufSize)
+          readCount += tocopy
 
-        # Cann proc again - this is not realy a recurisve call since
-        # only one level should be ever active.
-        return s.readDataImpl(s, buffer, buflen)
+      echo "\treads", readCount, "bytes from input stream, can read more"
+      return readCount
 
-  result.mode = mode
-  result.session = sftp_init(s)
+      # if sftp.buffer.len == 0: # has data in buffer, reading it first
+      #   copymem(buffer, sftp.buffer.cstring, copylen)
+      #   sftp.buffer = sftp.buffer[buflen .. ^1]
+      # else: # No data in buffer, need to read from remote first
 
-  if result.session == nil:
-    raise SSHError(
-      msg: "Failed to init SFTP session"
-    )
+      #   # Read data into buffer
+      #   sftp.buffer = newStringOfCap(defBufSize)
+      #   discard sftp.handle.sftpRead(sftp.buffer.cstring, defBufSize)
 
-  let flags =
-    case mode:
-      of fmWrite: bitand [
-        LIBSSH2_FXF_WRITE,
-        LIBSSH2_FXF_CREAT,
-        LIBSSH2_FXF_TRUNC
-      ]
+      #   # Cann proc again - this is not realy a recurisve call since
+      #   # only one level should be ever active.
+      #   return s.readDataImpl(s, buffer, buflen)
 
-      of fmRead: bitand [
-        LIBSSH2_FXF_READ
-      ]
+proc sftpFStat(s: Sftp, remotepath: string): SftpAttributes =
+  var handle = s.sftpOpen(
+    filename = remotepath.cstring,
+    flags = cast[int32](fileModeToLibSSH(fmRead)),
+    mode = 0007
+  )
 
-      of fmReadWrite: bitand [
-        LIBSSH2_FXF_WRITE,
-        LIBSSH2_FXF_READ,
-        LIBSSH2_FXF_CREAT,
-        LIBSSH2_FXF_TRUNC
-      ]
+  while true:
+    echo "sftp stat"
+    let rc = sftp_fstat_ex(handle, result, 0)
+    if rc == LIBSSH2_ERROR_EAGAIN:
+      echo rc, ": ", getErrorName(rc)
+      discard
+    elif rc < 0:
+      raise SSHError(
+        msg: "Failed to read stat from file, rc: " & $rc & ", " & getErrorName(rc),
+        rc: rc
+      )
 
-      of fmReadWriteExisting: bitand [
-        LIBSSH2_FXF_WRITE,
-        LIBSSH2_FXF_READ,
-        LIBSSH2_FXF_TRUNC
-      ]
+    else:
+      discard handle.sftp_close()
+      return result
 
-      of fmAppend: bitand [
-        LIBSSH2_FXF_WRITE,
-        LIBSSH2_FXF_CREAT,
-        LIBSSH2_FXF_APPEND
-      ]
 
+proc openSftpStream(
+  s: Sftp,
+  remotepath: string,
+  remotemode: FileMode = fmWrite,
+  permissions: int = 0777
+     ): SFTPFStream =
+  ## Open file in new sftp session. Closing file will close the
+  ## session
+  new(result)
+  initSFTPStream(result)
+
+  result.mode = remotemode
+  result.session = s
+
+  let attrs = sftpFStat(s, remotepath)
+
+  let flags = fileModeToLibSSH(remotemode)
   result.handle = result.session.sftpOpen(
     filename = remotepath.cstring,
     flags = cast[int32](flags),
@@ -601,6 +703,50 @@ proc sftpOpen(
   )
 
 
+#=======================  exposed SFTP functions  ========================#
+
+proc sftpInit*(s: SSHConnection): Sftp =
+  ## Open SFT session within ssh session `s`
+  result = s.session.sftpInit()
+  if result.isNil():
+    let rc = cast[int](result.sftp_last_error())
+
+    raise SSHError(
+      rc: rc,
+      msg:
+        if rc > 0: getSftpErrorName(rc)
+        else: getErrorName(rc)
+    )
+
+proc copyFileTo*(s: Sftp, source, dest: string): void =
+  ## Copy local file `source` to remote file `dest`
+  var stream = s.openSftpStream(
+    remotepath = dest,
+    remotemode = fmWrite
+  )
+
+
+  stream.close()
+
+proc copyFileFrom*(s: Sftp, source, dest: string): void =
+  ## Copy remote file `source` to local path `dest`
+  discard
+
+proc readFile*(s: Sftp, file: string): string =
+  ## Read content of the remote file
+  discard
+
+proc openFileRead*(s: Sftp, file: string): SFTPFStream =
+  ## Open remote file sftp stream
+  result = s.openSftpStream(
+    remotepath = file,
+    remotemode = fmRead
+  )
+
+proc readLine*(s: var SFTPFStream): string =
+  discard s.readLine(result)
+
+#=========================  SCP file operations  =========================#
 
 proc scpSendFile*(
   ssc: var SSHConnection,

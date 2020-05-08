@@ -630,7 +630,7 @@ macro shellAssign*(cmd: untyped): untyped =
     echo result.repr
 
 when isMainModule:
-  if true:
+  if false:
     block:
       var conn = sshInit("localhost", 22)
       conn.sshHandshake()
@@ -642,6 +642,40 @@ when isMainModule:
 
       "/tmp/test.txt".writeFile("hello world!".repeat(256))
       conn.scpSendFile("/tmp/test.txt", "/tmp/remote.txt")
+
+  if true:
+    var conn = sshInit("localhost", 22)
+    conn.sshHandshake()
+    conn.sshKnownHosts("localhost")
+    conn.sshAuth(
+      username = "ssh-test-user",
+      password = "ssh-password"
+    )
+
+    var sftp = conn.sftpInit()
+
+    "/tmp/test-local.txt".writeFile("hello\n".repeat(12))
+
+    block:
+      var file = sftp.openFileRead("/tmp/test-remote.txt")
+      for line in file.readLine():
+        echo "-> ", line
+
+      file.close()
+
+    try:
+      sftp.copyFileTo(
+        "/tmp/test-local.txt",
+        "/tmp/test-remote.txt"
+      )
+    except:
+      echo conn.session.getSessionError()
+      raise getCurrentException()
+
+    let content = sftp.readFile(
+      "/tmp/test-remote.txt"
+    )
+
 
 
   if false:
